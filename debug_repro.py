@@ -13,8 +13,8 @@ def debug():
     print(f"N Regs: {state['n_regs']}, N Instr: {state['n_instructions']}")
     print(f"IP: {state['ip']}, Code Start: {state['code_start']}")
     
-    # Run for 200 steps
-    for i in range(200):
+    # Run for 400 steps
+    for i in range(400):
         print(f"\nStep {i}: IP={state['ip']}, Regs={state['registers'][:4]}")
         state = vm_step(state, cfg)
         
@@ -22,7 +22,8 @@ def debug():
             print(f"!!! BIRTH at step {i} !!!")
             print(f"Child Len: {state['child_len']}")
             print(f"Child Genome: {state['child_genome'][:50]}")
-            break
+            # Do NOT break, let it continue
+            # break
 
 if __name__ == "__main__":
     debug()

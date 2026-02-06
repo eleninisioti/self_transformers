@@ -18,6 +18,7 @@ from functools import partial
 import numpy as np
 from tqdm import trange
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 import io
 try:
     import imageio
@@ -76,6 +77,7 @@ class Config:
     
     point_mutation_rate: float = 0.01
     indel_rate: float = 0.005
+    use_species_color: bool = True
     
 
 def make_config(**kwargs) -> Config:
@@ -105,6 +107,8 @@ def create_organism_state(cfg: Config):
         'has_child': jnp.bool_(False),
         'child_genome': jnp.full(cfg.max_genome_len, EMPTY, dtype=jnp.int32),
         'child_len': jnp.int32(0),
+        'color': jnp.zeros(3, dtype=jnp.float32), 
+        'child_color': jnp.zeros(3, dtype=jnp.float32),
         'instr_ops': jnp.full((cfg.max_instructions, cfg.max_ops_per_instr), NOP, dtype=jnp.int32),
         'instr_args': jnp.zeros((cfg.max_instructions, cfg.max_ops_per_instr, 2), dtype=jnp.int32),
         'instr_n_ops': jnp.zeros(cfg.max_instructions, dtype=jnp.int32),
@@ -179,8 +183,8 @@ def parse_genome(genome: jnp.ndarray, genome_len: jnp.int32, cfg: Config):
             at_end = (ptr >= end) | (ptr >= genome_len)
             gene = jnp.where(at_end, NOP, genome[ptr])
             
-            is_2arg = (gene == MOVE) | (gene == LOAD) | (gene == STORE) | (gene == ADD) | (gene == SUB)
-            is_1arg = (gene == READ_SIZE) | (gene == ALLOCATE) | (gene == INC) | (gene == DEC) | (gene == JUMP) | (gene == IFZERO)
+            is_2arg = (gene == MOVE) | (gene == LOAD) | (gene == STORE) | (gene == ADD) | (gene == SUB) | (gene == IFZERO)
+            is_1arg = (gene == READ_SIZE) | (gene == ALLOCATE) | (gene == INC) | (gene == DEC) | (gene == JUMP)
             is_0arg = gene == DIVIDE
             is_op = is_2arg | is_1arg | is_0arg
             
@@ -240,11 +244,11 @@ def parse_genome(genome: jnp.ndarray, genome_len: jnp.int32, cfg: Config):
 # ==========================================
 
 def vm_step(state: dict, cfg: Config):
-    """Execute one VM step for an organism."""
+    """Execute one VM step for an organism (Logical Instruction version)."""
     genome = state['genome']
     genome_len = state['genome_len']
     registers = state['registers']
-    ip = state['ip']
+    ip = state['ip'] # Logical IP (0..n_instructions-1)
     code_start = state['code_start']
     n_regs = state['n_regs']
     n_instructions = state['n_instructions']
@@ -254,27 +258,18 @@ def vm_step(state: dict, cfg: Config):
     child_len = state['child_len']
     has_child = state['has_child']
     
-    code_len = genome_len - code_start
-    valid_code = code_len > 0
+    # Ensure IP is valid (wrap-around safety for logical index)
+    ip = jnp.where((ip < 0) | (ip >= n_instructions), 0, ip)
     
-    ip = jnp.where(
-        valid_code & ((ip < code_start) | (ip >= genome_len)),
-        code_start,
-        ip
-    )
-    
-    op_code = jnp.where(valid_code & (ip < genome_len), genome[ip], 0)
-    ip = ip + 1
-    ip = jnp.where(ip >= genome_len, code_start, ip)
-    
-    instr_idx = jnp.where(n_instructions > 0, op_code % n_instructions, 0)
+    # Next IP (default increment)
+    next_ip = (ip + 1) % jnp.maximum(n_instructions, 1)
     
     def exec_op(carry, op_idx):
-        registers, child_genome, child_len, has_child, ip = carry
+        registers, child_genome, child_len, has_child, ip_ctrl = carry
         
-        op = instr_ops[instr_idx, op_idx]
-        arg0 = instr_args[instr_idx, op_idx, 0]
-        arg1 = instr_args[instr_idx, op_idx, 1]
+        op = instr_ops[ip, op_idx]
+        arg0 = instr_args[ip, op_idx, 0]
+        arg1 = instr_args[ip, op_idx, 1]
         
         valid_op = op != NOP
         
@@ -302,13 +297,13 @@ def vm_step(state: dict, cfg: Config):
             child_genome
         )
         
-        # LOAD: registers[arg1] = genome[registers[arg0]]
+        # LOAD
         is_load = op == LOAD
         load_addr = get_reg(arg0)
         load_val = jnp.where((load_addr >= 0) & (load_addr < genome_len), genome[load_addr], 0)
         registers = jnp.where(is_load & valid_op, set_reg(arg1, load_val), registers)
         
-        # STORE: child[registers[arg1]] = registers[arg0]
+        # STORE
         is_store = op == STORE
         store_addr = get_reg(arg1)
         store_val = get_reg(arg0)
@@ -319,68 +314,48 @@ def vm_step(state: dict, cfg: Config):
             child_genome
         )
         
-        # MOVE: registers[arg1] = registers[arg0]
-        registers = jnp.where(
-            (op == MOVE) & valid_op, 
-            set_reg(arg1, get_reg(arg0)), 
-            registers
-        )
+        # MOVE
+        registers = jnp.where((op == MOVE) & valid_op, set_reg(arg1, get_reg(arg0)), registers)
+        # INC
+        registers = jnp.where((op == INC) & valid_op, set_reg(arg0, get_reg(arg0) + 1), registers)
+        # DEC
+        registers = jnp.where((op == DEC) & valid_op, set_reg(arg0, get_reg(arg0) - 1), registers)
+        # ADD
+        registers = jnp.where((op == ADD) & valid_op, set_reg(arg0, get_reg(arg0) + get_reg(arg1)), registers)
+        # SUB
+        registers = jnp.where((op == SUB) & valid_op, set_reg(arg0, get_reg(arg0) - get_reg(arg1)), registers)
         
-        # INC: registers[arg0] += 1
-        registers = jnp.where(
-            (op == INC) & valid_op, 
-            set_reg(arg0, get_reg(arg0) + 1), 
-            registers
-        )
-        
-        # DEC: registers[arg0] -= 1
-        registers = jnp.where(
-            (op == DEC) & valid_op, 
-            set_reg(arg0, get_reg(arg0) - 1), 
-            registers
-        )
-        
-        # ADD: registers[arg0] += registers[arg1]
-        registers = jnp.where(
-            (op == ADD) & valid_op, 
-            set_reg(arg0, get_reg(arg0) + get_reg(arg1)), 
-            registers
-        )
-        
-        # SUB: registers[arg0] -= registers[arg1]
-        registers = jnp.where(
-            (op == SUB) & valid_op, 
-            set_reg(arg0, get_reg(arg0) - get_reg(arg1)), 
-            registers
-        )
-        
-        # IFZERO: skip next if register is zero
+        # IFZERO
         is_ifzero = op == IFZERO
         skip = get_reg(arg0) == 0
-        ip = jnp.where(is_ifzero & valid_op & skip, ip + 1, ip)
-        ip = jnp.where(ip >= genome_len, code_start, ip)
+        # Add relative offset to IP
+        ip_ctrl = jnp.where(is_ifzero & valid_op & skip, (ip_ctrl + arg1) % jnp.maximum(n_instructions, 1), ip_ctrl)
         
         # JUMP
         is_jump = op == JUMP
-        jump_target = jnp.where(code_len > 0, code_start + (arg0 % code_len), code_start)
-        ip = jnp.where(is_jump & valid_op, jump_target, ip)
+        jump_target = arg0 % jnp.maximum(n_instructions, 1)
+        ip_ctrl = jnp.where(is_jump & valid_op, jump_target, ip_ctrl)
         
-        # DIVIDE: give birth
+        # DIVIDE
         is_divide = op == DIVIDE
         valid_divide = child_len > 0
-        has_child = jnp.where(is_divide & valid_op & valid_divide, True, has_child)
+        should_divide = is_divide & valid_op & valid_divide
         
-        return (registers, child_genome, child_len, has_child, ip), None
+        has_child = jnp.where(should_divide, True, has_child)
+        # Reset IP to 0 on birth
+        ip_ctrl = jnp.where(should_divide, 0, ip_ctrl)
+        
+        return (registers, child_genome, child_len, has_child, ip_ctrl), None
     
-    (registers, child_genome, child_len, has_child, ip), _ = lax.scan(
+    (registers, child_genome, child_len, has_child, next_ip), _ = lax.scan(
         exec_op,
-        (registers, child_genome, child_len, has_child, ip),
+        (registers, child_genome, child_len, has_child, next_ip),
         jnp.arange(cfg.max_ops_per_instr)
     )
     
     new_state = state.copy()
     new_state['registers'] = registers
-    new_state['ip'] = ip
+    new_state['ip'] = next_ip
     new_state['child_genome'] = child_genome
     new_state['child_len'] = child_len
     new_state['has_child'] = has_child
@@ -392,9 +367,9 @@ def vm_step(state: dict, cfg: Config):
 # 6. MUTATION
 # ==========================================
 
-def mutate_genome(key: jax.Array, genome: jnp.ndarray, genome_len: jnp.int32, cfg: Config):
+def mutate_genome(key: jax.Array, genome: jnp.ndarray, genome_len: jnp.int32, color: jnp.ndarray, cfg: Config):
     """Apply mutations to a genome."""
-    k1, k2, k3, k4, k5 = random.split(key, 5)
+    k1, k2, k3, k4, k5, k6 = random.split(key, 6)
     
     # Point mutation
     do_point = random.uniform(k1) < cfg.point_mutation_rate
@@ -442,8 +417,27 @@ def mutate_genome(key: jax.Array, genome: jnp.ndarray, genome_len: jnp.int32, cf
         lambda args: args,
         (genome, genome_len)
     )
+
+    # Color mutation (HSV)
+    # If any mutation happened, shift color slightly
+    mutated = do_point | do_indel
     
-    return genome, genome_len
+    # Noise for Hue, Sat, Val separated
+    # Hue: wider drift, wrap around
+    noise_h = random.uniform(k6, (1,), minval=-0.05, maxval=0.05)
+    noise_sv = random.uniform(k6, (2,), minval=-0.02, maxval=0.02)
+    noise = jnp.concatenate([noise_h, noise_sv])
+    
+    # Only apply noise if mutated
+    delta = jnp.where(mutated, noise, 0.0)
+    
+    h = (color[0] + delta[0]) % 1.0 # Wrap hue
+    s = jnp.clip(color[1] + delta[1], 0.0, 1.0)
+    v = jnp.clip(color[2] + delta[2], 0.0, 1.0)
+    
+    new_color = jnp.array([h, s, v])
+    
+    return genome, genome_len, new_color
 
 
 # ==========================================
@@ -459,15 +453,21 @@ def create_ancestor_genome(cfg: Config):
     # Instructions
     g += [I, READ_SIZE, 1]                           # I0: R1 = size
     g += [I, ALLOCATE, 1]                            # I1: allocate R1 bytes
-    g += [I, LOAD, 2, 0, STORE, 0, 2, INC, 2]        # I2: copy loop body
-    g += [I, MOVE, 1, 3, SUB, 3, 2]                  # I3: R3 = R1 - R2
-    g += [I, IFZERO, 3]                              # I4: skip if done
-    g += [I, JUMP, 2]                                # I5: loop back
-    g += [I, DIVIDE]                                 # I6: birth
+    g += [I, SUB, 2, 2]                              # I2: R2 = 0 (loop counter)
+    
+    # Inefficient Loop Body (Split into 3 instructions)
+    g += [I, LOAD, 2, 0]                             # I3: R0 = genome[R2]
+    g += [I, STORE, 0, 2]                            # I4: child[R2] = R0
+    g += [I, INC, 2]                                 # I5: R2++
+    
+    g += [I, MOVE, 1, 3, SUB, 3, 2]                  # I6: R3 = R1 - R2
+    g += [I, IFZERO, 3, 1]                           # I7: skip next (JUMP) if done
+    g += [I, JUMP, 3]                                # I8: loop back to I3
+    g += [I, DIVIDE]                                 # I9: birth
     g += [SEP]
     
     # Code
-    g += [0, 1, 2, 3, 4, 5, 6]
+    g += [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     
     genome = jnp.full(cfg.max_genome_len, EMPTY, dtype=jnp.int32)
     genome = genome.at[:len(g)].set(jnp.array(g, dtype=jnp.int32))
@@ -476,11 +476,12 @@ def create_ancestor_genome(cfg: Config):
     return genome, genome_len
 
 
-def init_organism(genome: jnp.ndarray, genome_len: jnp.int32, cfg: Config):
+def init_organism(genome: jnp.ndarray, genome_len: jnp.int32, color: jnp.ndarray, cfg: Config):
     """Initialize an organism from a genome."""
     state = create_organism_state(cfg)
     state['genome'] = genome
     state['genome_len'] = genome_len
+    state['color'] = color
     
     parsed = parse_genome(genome, genome_len, cfg)
     state['n_regs'] = parsed['n_regs']
@@ -489,7 +490,7 @@ def init_organism(genome: jnp.ndarray, genome_len: jnp.int32, cfg: Config):
     state['instr_ops'] = parsed['instr_ops']
     state['instr_args'] = parsed['instr_args']
     state['instr_n_ops'] = parsed['instr_n_ops']
-    state['ip'] = parsed['code_start']
+    state['ip'] = jnp.int32(0)
     
     return state
 
@@ -513,12 +514,21 @@ def init_population(key: jax.Array, cfg: Config):
     is_alive = jnp.zeros(cfg.pop_size, dtype=jnp.bool_)
     is_alive = is_alive.at[alive_indices].set(True)
     
-    def init_one(i, alive_mask_val):
-        state = init_organism(ancestor_genome, ancestor_len, cfg)
+    # Generate random colors in HSV
+    # Hue: [0, 1] random
+    # Sat: [0.7, 1.0] random (vibrant)
+    # Val: [0.8, 1.0] random (bright)
+    h = random.uniform(k2, (cfg.pop_size, 1))
+    s = random.uniform(k2, (cfg.pop_size, 1), minval=0.7, maxval=1.0)
+    v = random.uniform(k2, (cfg.pop_size, 1), minval=0.8, maxval=1.0)
+    colors = jnp.concatenate([h, s, v], axis=-1)
+    
+    def init_one(i, alive_mask_val, col):
+        state = init_organism(ancestor_genome, ancestor_len, col, cfg)
         state['alive'] = alive_mask_val
         return state
     
-    pop = jax.vmap(init_one)(jnp.arange(cfg.pop_size), is_alive)
+    pop = jax.vmap(init_one)(jnp.arange(cfg.pop_size), is_alive, colors)
     return pop
 
 
@@ -553,23 +563,24 @@ def cycle_step(cfg: Config, pop: dict, key: jax.Array):
     n_births = jnp.sum(has_child)
     
     # Mutate children
-    mut_keys = random.split(key, cfg.pop_size)
+    k_mut, k_place = random.split(key)
+    mut_keys = random.split(k_mut, cfg.pop_size)
     
     def mutate_one(args):
-        key, genome, length, has = args
+        key, genome, length, color, has = args
         return lax.cond(
             has,
-            lambda g: mutate_genome(key, g[0], g[1], cfg),
-            lambda g: (g[0], g[1]),
-            (genome, length)
+            lambda g: mutate_genome(key, g[0], g[1], g[2], cfg),
+            lambda g: (g[0], g[1], g[2]),
+            (genome, length, color)
         )
     
-    mutated_genomes, mutated_lens = jax.vmap(mutate_one)(
-        (mut_keys, pop['child_genome'], pop['child_len'], has_child)
+    mutated_genomes, mutated_lens, mutated_colors = jax.vmap(mutate_one)(
+        (mut_keys, pop['child_genome'], pop['child_len'], pop['color'], has_child)
     )
     
-
     # Spatial Reproduction (Grid Physics)
+    # ... (omitted shared logic for brevity if needed, but here replacing full block)
     # Treat 1D array as (H, W) grid
     # For simplicity, let's assume square grid or close to it
     grid_side = int(np.ceil(np.sqrt(cfg.pop_size)))
@@ -623,7 +634,12 @@ def cycle_step(cfg: Config, pop: dict, key: jax.Array):
     # If neighbor alive: score = age
     
     base_score = jnp.where(neighbor_alive, neighbor_age.astype(jnp.float32), 1e9)
-    final_score = jnp.where(neighbor_valid, base_score, -1.0)
+    valid_score = jnp.where(neighbor_valid, base_score, -1.0)
+    
+    # Break ties randomly: Add small random noise to scores
+    # Noise range: [0, 0.5) to avoid changing integer order (scores are integers or large)
+    noise = random.uniform(k_place, (cfg.pop_size, 8)) * 0.5
+    final_score = valid_score + noise
     
     # 4. Select best target for each parent
     # argmax gives index 0..7
@@ -642,10 +658,11 @@ def cycle_step(cfg: Config, pop: dict, key: jax.Array):
     child_parsed = jax.vmap(lambda g, l: parse_genome(g, l, cfg))(mutated_genomes, mutated_lens)
     
     # Build child states
-    def build_child_state(genome, genome_len, parsed):
+    def build_child_state(genome, genome_len, color, parsed):
         state = create_organism_state(cfg)
         state['genome'] = genome
         state['genome_len'] = genome_len
+        state['color'] = color
         state['n_regs'] = parsed['n_regs']
         state['n_instructions'] = parsed['n_instructions']
         state['code_start'] = parsed['code_start']
@@ -655,7 +672,7 @@ def cycle_step(cfg: Config, pop: dict, key: jax.Array):
         state['ip'] = parsed['code_start']
         return state
         
-    child_states = jax.vmap(build_child_state)(mutated_genomes, mutated_lens, child_parsed)
+    child_states = jax.vmap(build_child_state)(mutated_genomes, mutated_lens, mutated_colors, child_parsed)
     
     # 6. Scatter updates
     # We want to place `child_states` at `target_indices` where `has_child` is True.
@@ -682,9 +699,14 @@ def cycle_step(cfg: Config, pop: dict, key: jax.Array):
         
     pop = jax.tree.map(lambda c, u: scatter_update(c, u), pop, update_payload)
     
-    # Reset child buffers
-    pop['has_child'] = jnp.zeros(cfg.pop_size, dtype=jnp.bool_)
+    # 7. Post-reproduction cleanup
+    # Clear child buffer for parents that gave birth
+    empty_genome = jnp.full(cfg.max_genome_len, EMPTY, dtype=jnp.int32)
+    pop['child_genome'] = jnp.where(has_child[:, None], empty_genome, pop['child_genome'])
     pop['child_len'] = jnp.where(has_child, jnp.int32(0), pop['child_len'])
+    
+    # Reset has_child for everyone for next cycle
+    pop['has_child'] = jnp.zeros(cfg.pop_size, dtype=jnp.bool_)
     
     # Stats
     alive_count = jnp.sum(pop['alive'])
@@ -748,24 +770,34 @@ def save_grid_gif(snapshots, filename, cfg):
         
         # Prepare data
         alive_grid = np.pad(alive_mask, (0, pad_size), constant_values=False).reshape(grid_side, grid_side)
-        len_grid = np.pad(genome_lens, (0, pad_size), constant_values=0).reshape(grid_side, grid_side)
         
-        # Create RGB image
-        # Background: Black (0,0,0) or Very Dark Gray
-        # Alive: Colored by length (Blue -> Red via Viridis or similar)
-        
-        # Normalize length for color mapping (0 to max_genome_len)
-        norm_len = np.clip(len_grid / max_len, 0, 1)
-        
-        # Use a colormap
-        cmap = plt.get_cmap('viridis')
-        rgba = cmap(norm_len)  # (N, N, 4)
-        
-        # Apply mask: Dead cells are black
-        # alpha is 1 where alive, 0 where dead (visual distinction)
-        # But for 'black' dead cells, we just zero out the RGB
-        
-        rgb = rgba[..., :3] # (N, N, 3)
+        if cfg.use_species_color and 'color' in snap:
+            # Use species color (HSV)
+            colors = snap['color'] # (N, 3) HSV
+            
+            # Pad colors
+            # pad with 0s
+            colors_padded = np.pad(colors, ((0, pad_size), (0, 0)), constant_values=0.0)
+            hsv_grid = colors_padded.reshape(grid_side, grid_side, 3)
+            
+            # Convert HSV to RGB
+            rgb_grid = mcolors.hsv_to_rgb(hsv_grid)
+            rgb = rgb_grid
+        else:
+            # Use genome length heatmap
+            len_grid = np.pad(genome_lens, (0, pad_size), constant_values=0).reshape(grid_side, grid_side)
+            
+            # Create RGB image
+            # Background: Black (0,0,0) or Very Dark Gray
+            # Alive: Colored by length (Blue -> Red via Viridis or similar)
+            
+            # Normalize length for color mapping (0 to max_genome_len)
+            norm_len = np.clip(len_grid / max_len, 0, 1)
+            
+            # Use a colormap
+            cmap = plt.get_cmap('viridis')
+            rgba = cmap(norm_len)  # (N, N, 4)
+            rgb = rgba[..., :3] # (N, N, 3)
         
         # Vectorized masking
         mask = alive_grid[..., None]
@@ -845,47 +877,52 @@ def run_simulation(key: jax.Array, cfg: Config, total_cycles: int,
     
     cycle_keys = random.split(k2, total_cycles)
     
-    for chunk in trange(n_chunks, desc="Running"):
-        start = chunk * log_interval
-        end = (chunk + 1) * log_interval
-        chunk_keys = cycle_keys[start:end]
-        
-        pop, stats = jit_scan(pop, chunk_keys)
-        # Block until computed
-        pop = jax.block_until_ready(pop)
-        
-        # Log last stats of chunk
-        cycle_num = end
-        pop_size = int(stats['pop_size'][-1])
-        births = int(jnp.sum(stats['births']))
-        avg_len = float(stats['avg_genome_len'][-1])
-        
-        print(f"Cycle {cycle_num}: Pop={pop_size}, Births={births}, AvgLen={avg_len:.1f}")
-        
-        if use_wandb:
-            wandb.log({
-                "cycle": cycle_num,
-                "population/size": pop_size,
-                "population/births_interval": births,
-                "genome/avg_len": avg_len,
-            })
-        
-        # Collect snapshot for this chunk (end state)
-        snapshot = {
-            'cycle': cycle_num,
-            'alive': np.array(pop['alive']),
-            'genome_len': np.array(pop['genome_len'])
-        }
-        
-        chunk_rec = {
-            'cycle': cycle_num,
-            'pop_size': pop_size,
-            'births': births,
-            'avg_len': avg_len,
-            'snapshot': snapshot
-        }
-        
-        all_stats.append(chunk_rec)
+    try:
+        for chunk in trange(n_chunks, desc="Running"):
+            start = chunk * log_interval
+            end = (chunk + 1) * log_interval
+            chunk_keys = cycle_keys[start:end]
+            
+            pop, stats = jit_scan(pop, chunk_keys)
+            # Block until computed
+            pop = jax.block_until_ready(pop)
+            
+            # Log last stats of chunk
+            cycle_num = end
+            pop_size = int(stats['pop_size'][-1])
+            births = int(jnp.sum(stats['births']))
+            avg_len = float(stats['avg_genome_len'][-1])
+            
+            print(f"Cycle {cycle_num}: Pop={pop_size}, Births={births}, AvgLen={avg_len:.1f}")
+            
+            if use_wandb:
+                wandb.log({
+                    "cycle": cycle_num,
+                    "population/size": pop_size,
+                    "population/births_interval": births,
+                    "genome/avg_len": avg_len,
+                })
+            
+            # Collect snapshot for this chunk (end state)
+            snapshot = {
+                'cycle': cycle_num,
+                'alive': np.array(pop['alive']),
+                'genome_len': np.array(pop['genome_len']),
+                'color': np.array(pop['color'])
+            }
+            
+            chunk_rec = {
+                'cycle': cycle_num,
+                'pop_size': pop_size,
+                'births': births,
+                'avg_len': avg_len,
+                'snapshot': snapshot
+            }
+            
+            all_stats.append(chunk_rec)
+    except KeyboardInterrupt:
+        print("Simulation interrupted by user.")
+            
     
     if use_wandb:
         wandb.finish()
@@ -898,26 +935,28 @@ def run_simulation(key: jax.Array, cfg: Config, total_cycles: int,
 # ==========================================
 if __name__ == "__main__":
     cfg = make_config(
-        pop_size=1024,
+        pop_size=4096,
         initial_pop=4,
-        max_age=40_000,
-        point_mutation_rate=0.02,
-        indel_rate=0.01,
+        max_age=jnp.inf,
+        point_mutation_rate=0.05,
+        indel_rate=0.2,
     )
 
     key = random.PRNGKey(42)
     pop, stats = run_simulation(
         key, 
         cfg, 
-        total_cycles=10000,
+        total_cycles=50_000,
         log_interval=100,
         use_wandb=False,
     )
 
     print("\n=== FINAL STATE ===")
     alive = pop['alive']
+    alive_count = jnp.sum(alive)
+    avg_len = jnp.sum(jnp.where(alive, pop['genome_len'], 0)) / jnp.maximum(alive_count, 1)
 
-    print(f"Avg genome length: {float(jnp.mean(jnp.where(alive, pop['genome_len'], 0))):.1f}")
+    print(f"Avg genome length: {float(avg_len):.1f}")
 
     # Plotting and GIF generation
     timestamps = [s['cycle'] for s in stats]
